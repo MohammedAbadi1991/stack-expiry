@@ -1,0 +1,378 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  stack-expiry: tag any CloudFormation stack with ttl=2h and it deletes itself
+  on time. EventBridge + Step Functions (JSONata) + EventBridge Scheduler + SNS.
+  No Lambda functions, no servers, no pipeline.
+
+Parameters:
+  TagKey:
+    Type: String
+    Default: ttl
+    AllowedPattern: '^[A-Za-z0-9_.:-]{1,64}$'
+    Description: Stack tag that holds the time to live, for example ttl=30m, ttl=2h or ttl=3d.
+  WarnMinutes:
+    Type: Number
+    Default: 15
+    MinValue: 1
+    MaxValue: 1440
+    Description: Send a warning this many minutes before a stack is deleted.
+  NotifyEmail:
+    Type: String
+    Default: ''
+    Description: Optional email address to subscribe to the notification topic.
+  DeletionPolicyArn:
+    Type: String
+    Default: arn:aws:iam::aws:policy/AdministratorAccess
+    Description: >
+      Managed policy for the role CloudFormation assumes to delete expired stacks.
+      It must be able to delete every resource type your temporary stacks contain.
+      Narrow it if your sandbox stacks only use a few services.
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref NotifyEmail, '']]
+
+Resources:
+  Topic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: stack-expiry
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref Topic
+      Protocol: email
+      Endpoint: !Ref NotifyEmail
+
+  ScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}'
+
+  # CloudFormation assumes this role to delete the resources of an expired stack.
+  # Only the CloudFormation service can assume it, and only SchedulerRole may pass it.
+  DeletionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - !Ref DeletionPolicyArn
+
+  # EventBridge Scheduler assumes this role when a schedule fires.
+  # It can delete a stack only while the stack still carries the ttl tag.
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: expire
+          # Written as a JSON string because the tag key is part of a condition key name.
+          PolicyDocument: !Sub |
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "DeleteOnlyTaggedStacks",
+                  "Effect": "Allow",
+                  "Action": "cloudformation:DeleteStack",
+                  "Resource": "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/*",
+                  "Condition": { "Null": { "aws:ResourceTag/${TagKey}": "false" } }
+                },
+                {
+                  "Sid": "PassDeletionRoleToCloudFormation",
+                  "Effect": "Allow",
+                  "Action": "iam:PassRole",
+                  "Resource": "${DeletionRole.Arn}",
+                  "Condition": { "StringEquals": { "iam:PassedToService": "cloudformation.amazonaws.com" } }
+                },
+                {
+                  "Sid": "Warn",
+                  "Effect": "Allow",
+                  "Action": "sns:Publish",
+                  "Resource": "${Topic}"
+                }
+              ]
+            }
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: plan
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - scheduler:CreateSchedule
+                  - scheduler:DeleteSchedule
+                Resource: !Sub 'arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${ScheduleGroup}/*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt SchedulerRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: scheduler.amazonaws.com
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref Topic
+
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Ref AWS::StackName
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt StateMachineRole.Arn
+      DefinitionSubstitutions:
+        TagKey: !Ref TagKey
+        WarnMinutes: !Ref WarnMinutes
+        Group: !Ref ScheduleGroup
+        TopicArn: !Ref Topic
+        SchedulerRoleArn: !GetAtt SchedulerRole.Arn
+        DeletionRoleArn: !GetAtt DeletionRole.Arn
+      Definition:
+        Comment: Turn a ttl tag on a CloudFormation stack into a one-time delete schedule.
+        QueryLanguage: JSONata
+        StartAt: DescribeStack
+        States:
+          DescribeStack:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:cloudformation:describeStacks
+            Arguments:
+              StackName: "{% $states.input.detail.`stack-id` %}"
+            Assign:
+              stackId: "{% $states.input.detail.`stack-id` %}"
+              status: "{% $states.input.detail.`status-details`.status %}"
+              stackName: "{% $states.result.Stacks[0].StackName %}"
+              uid: "{% $split($states.input.detail.`stack-id`, '/')[2] %}"
+              ttl: "{% ( $t := $states.result.Stacks[0].Tags[Key = '${TagKey}'].Value; $exists($t) ? $string($t) : '' ) %}"
+              nested: "{% $exists($states.result.Stacks[0].ParentId) %}"
+            Retry:
+              - ErrorEquals: [CloudFormation.CloudFormationException, States.TaskFailed]
+                IntervalSeconds: 2
+                MaxAttempts: 3
+                BackoffRate: 2
+            Next: Route
+          Route:
+            Type: Choice
+            Choices:
+              - Comment: Nested stacks inherit tags. Only the root stack is scheduled.
+                Condition: "{% $nested %}"
+                Next: Ignored
+              - Condition: "{% $status = 'DELETE_FAILED' and $ttl != '' %}"
+                Next: NotifyDeleteFailed
+              - Condition: "{% $status = 'DELETE_FAILED' or ($status = 'CREATE_COMPLETE' and $ttl = '') %}"
+                Next: Ignored
+            Default: ClearExpireSchedule
+          ClearExpireSchedule:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:scheduler:deleteSchedule
+            Arguments:
+              Name: "{% 'expire-' & $uid %}"
+              GroupName: ${Group}
+            Catch:
+              - ErrorEquals: [Scheduler.ResourceNotFoundException]
+                Next: ClearWarnSchedule
+            Next: ClearWarnSchedule
+          ClearWarnSchedule:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:scheduler:deleteSchedule
+            Arguments:
+              Name: "{% 'warn-' & $uid %}"
+              GroupName: ${Group}
+            Catch:
+              - ErrorEquals: [Scheduler.ResourceNotFoundException]
+                Next: Plan
+            Next: Plan
+          Plan:
+            Type: Choice
+            Choices:
+              - Comment: Stack is gone or the tag was removed. The schedules are already cleared.
+                Condition: "{% $status = 'DELETE_COMPLETE' or $ttl = '' %}"
+                Next: Cleared
+              - Condition: "{% $not($exists($match($ttl, /^([1-9][0-9]{0,3})([mhd])$/))) %}"
+                Next: NotifyInvalidTtl
+            Default: ComputeExpiry
+          ComputeExpiry:
+            Type: Pass
+            Assign:
+              plan: >-
+                {% (
+                  $m := $match($ttl, /^([1-9][0-9]{0,3})([mhd])$/);
+                  $unit := $m.groups[1];
+                  $ms := $number($m.groups[0]) * ($unit = 'm' ? 60000 : $unit = 'h' ? 3600000 : 86400000);
+                  $warnMs := ${WarnMinutes} * 60000;
+                  $now := $millis();
+                  $fmt := '[Y0001]-[M01]-[D01]T[H01]:[m01]:[s01]';
+                  {
+                    'expiry': $fromMillis($now + $ms, $fmt),
+                    'warn': $fromMillis($now + $ms - $warnMs, $fmt),
+                    'needsWarning': $ms > $warnMs
+                  }
+                ) %}
+            Next: CreateExpireSchedule
+          CreateExpireSchedule:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:scheduler:createSchedule
+            Arguments:
+              Name: "{% 'expire-' & $uid %}"
+              GroupName: ${Group}
+              Description: "{% 'Delete stack ' & $stackName & ' (${TagKey}=' & $ttl & ')' %}"
+              ScheduleExpression: "{% 'at(' & $plan.expiry & ')' %}"
+              ScheduleExpressionTimezone: UTC
+              FlexibleTimeWindow:
+                Mode: 'OFF'
+              ActionAfterCompletion: DELETE
+              Target:
+                Arn: arn:aws:scheduler:::aws-sdk:cloudformation:deleteStack
+                RoleArn: ${SchedulerRoleArn}
+                Input: "{% $string({'StackName': $stackId, 'RoleARN': '${DeletionRoleArn}'}) %}"
+                RetryPolicy:
+                  MaximumRetryAttempts: 3
+                  MaximumEventAgeInSeconds: 3600
+            Next: NeedsWarning
+          NeedsWarning:
+            Type: Choice
+            Choices:
+              - Condition: "{% $plan.needsWarning %}"
+                Next: CreateWarnSchedule
+            Default: NotifyScheduled
+          CreateWarnSchedule:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:scheduler:createSchedule
+            Arguments:
+              Name: "{% 'warn-' & $uid %}"
+              GroupName: ${Group}
+              Description: "{% 'Warn before deleting stack ' & $stackName %}"
+              ScheduleExpression: "{% 'at(' & $plan.warn & ')' %}"
+              ScheduleExpressionTimezone: UTC
+              FlexibleTimeWindow:
+                Mode: 'OFF'
+              ActionAfterCompletion: DELETE
+              Target:
+                Arn: arn:aws:scheduler:::aws-sdk:sns:publish
+                RoleArn: ${SchedulerRoleArn}
+                Input: >-
+                  {% $string({
+                    'TopicArn': '${TopicArn}',
+                    'Subject': $substring('Expiring soon: ' & $stackName, 0, 100),
+                    'Message': 'Stack ' & $stackName & ' will be deleted at ' & $plan.expiry & ' UTC, in ${WarnMinutes} minutes. To keep it, change or remove its ${TagKey} tag, or turn on termination protection.'
+                  }) %}
+            Next: NotifyScheduled
+          NotifyScheduled:
+            Type: Task
+            Resource: arn:aws:states:::sns:publish
+            Arguments:
+              TopicArn: ${TopicArn}
+              Subject: "{% $substring('Expiry set: ' & $stackName, 0, 100) %}"
+              Message: "{% 'Stack ' & $stackName & ' has ${TagKey}=' & $ttl & ' and will be deleted at ' & $plan.expiry & ' UTC. Every successful deploy renews the timer. Remove the tag to cancel.' %}"
+            Output:
+              stack: "{% $stackName %}"
+              ttl: "{% $ttl %}"
+              deleteAt: "{% $plan.expiry & 'Z' %}"
+            End: true
+          NotifyInvalidTtl:
+            Type: Task
+            Resource: arn:aws:states:::sns:publish
+            Arguments:
+              TopicArn: ${TopicArn}
+              Subject: "{% $substring('Invalid ${TagKey} tag: ' & $stackName, 0, 100) %}"
+              Message: "{% 'Stack ' & $stackName & ' has ${TagKey}=' & $ttl & ', which is not a valid time to live. Use a number from 1 to 9999 followed by m, h or d, for example 30m, 2h or 3d. No expiry is scheduled for this stack.' %}"
+            Output:
+              stack: "{% $stackName %}"
+              invalidTtl: "{% $ttl %}"
+            End: true
+          NotifyDeleteFailed:
+            Type: Task
+            Resource: arn:aws:states:::sns:publish
+            Arguments:
+              TopicArn: ${TopicArn}
+              Subject: "{% $substring('Delete failed: ' & $stackName, 0, 100) %}"
+              Message: "{% 'Stack ' & $stackName & ' reached its expiry but CloudFormation could not delete it (DELETE_FAILED). Open the stack events to see which resource blocked the delete.' %}"
+            Output:
+              stack: "{% $stackName %}"
+              status: DELETE_FAILED
+            End: true
+          Cleared:
+            Type: Succeed
+            Output:
+              stack: "{% $stackName %}"
+              result: No expiry scheduled
+          Ignored:
+            Type: Succeed
+            Output:
+              stack: "{% $stackName %}"
+              result: Ignored
+
+  EventsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref StateMachine
+
+  StackEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Send finished CloudFormation stack operations to stack-expiry.
+      EventPattern:
+        source: [aws.cloudformation]
+        detail-type: [CloudFormation Stack Status Change]
+        detail:
+          status-details:
+            status: [CREATE_COMPLETE, UPDATE_COMPLETE, DELETE_COMPLETE, DELETE_FAILED]
+      Targets:
+        - Id: stack-expiry
+          Arn: !Ref StateMachine
+          RoleArn: !GetAtt EventsRole.Arn
+
+Outputs:
+  TopicArn:
+    Description: Subscribe to this topic for expiry notices and warnings.
+    Value: !Ref Topic
+  StateMachineArn:
+    Value: !Ref StateMachine
+  ScheduleGroup:
+    Description: All expiry schedules live in this EventBridge Scheduler group.
+    Value: !Ref ScheduleGroup
