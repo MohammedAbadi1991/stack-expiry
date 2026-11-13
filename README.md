@@ -48,6 +48,8 @@ The value is a number from 1 to 9999 followed by `m`, `h` or `d`.
 
 You get a message on the SNS topic when an expiry is set, a warning before deletion, a notice when a tag value is not valid, and a notice when a delete fails (for example, a bucket that is not empty).
 
+No email handy? `./examples/inbox.sh setup` subscribes a queue to the topic, and `./examples/inbox.sh` prints the notices received so far.
+
 ## How it works
 
 ```mermaid

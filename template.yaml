@@ -192,6 +192,9 @@ Resources:
                 Next: NotifyDeleteFailed
               - Condition: "{% $status = 'DELETE_FAILED' or ($status = 'CREATE_COMPLETE' and $ttl = '') %}"
                 Next: Ignored
+              - Comment: A new stack has no schedules yet, so there is nothing to clear.
+                Condition: "{% $status = 'CREATE_COMPLETE' %}"
+                Next: Plan
             Default: ClearExpireSchedule
           ClearExpireSchedule:
             Type: Task
