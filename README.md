@@ -69,6 +69,12 @@ flowchart LR
 4. The state machine creates two one-time schedules in EventBridge Scheduler. One calls `cloudformation:DeleteStack` directly through Scheduler's universal target. The other publishes the warning to SNS.
 5. Schedules delete themselves after they run. If you delete the stack yourself, or remove the tag, the state machine removes them.
 
+To try the tag parsing on its own, without deploying anything, run one state through the `TestState` API. Change the `ttl` value in the file's `input` to test other values:
+
+```bash
+aws stepfunctions test-state --cli-input-json file://examples/test-state.json --query output
+```
+
 Nested stacks inherit their parent's tags. The state machine ignores them and schedules only the root stack.
 
 ## Safety

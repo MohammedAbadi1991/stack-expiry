@@ -1,0 +1,5 @@
+{
+  "definition": "{\"Type\":\"Pass\",\"QueryLanguage\":\"JSONata\",\"Output\":\"{% ( $m := $match($states.input.ttl, /^([1-9][0-9]{0,3})([mhd])$/); $unit := $m.groups[1]; $ms := $number($m.groups[0]) * ($unit = 'm' ? 60000 : $unit = 'h' ? 3600000 : 86400000); {'valid': $exists($m), 'deleteAt': $exists($m) ? 'at(' & $fromMillis($millis() + $ms, '[Y0001]-[M01]-[D01]T[H01]:[m01]:[s01]') & ')' : null} ) %}\",\"End\":true}",
+  "input": "{\"ttl\":\"2h\"}",
+  "inspectionLevel": "INFO"
+}
